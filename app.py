@@ -7,6 +7,8 @@ import time
 import gzip
 import shutil
 from datetime import datetime, timedelta, timezone
+import concurrent.futures
+import zipfile
 
 # IST Offset
 IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -77,6 +79,11 @@ st.markdown("""
         [data-testid="stFileUploaderDropzone"] div div small {
            display: none !important;
         }
+        
+        /* Force Dataframe Font Weight */
+        div[data-testid="stDataFrame"] {
+            font-weight: 600 !important;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -144,6 +151,24 @@ def extract_date_from_filename(filename):
         return f"{d[:4]}-{d[4:6]}-{d[6:]}"
     return None
 
+def extract_csv_from_zip(zip_file):
+    try:
+        # zip_file is a UploadedFile object from streamlit
+        with zipfile.ZipFile(zip_file) as z:
+            # Find the first CSV file in the ZIP
+            csv_files = [f for f in z.namelist() if f.lower().endswith('.csv')]
+            if not csv_files:
+                st.error("No CSV file found in the ZIP archive.")
+                return None, None
+            
+            # Extract the first CSV found
+            csv_filename = csv_files[0]
+            with z.open(csv_filename) as f:
+                return f.read(), csv_filename
+    except Exception as e:
+        st.error(f"Error extracting ZIP file: {e}")
+        return None, None
+
 def load_token():
     if os.path.exists(TOKEN_FILE):
         try:
@@ -208,7 +233,7 @@ def load_nse_json():
         st.error(f"NSE.json not found at {NSE_JSON_PATH}")
         return pd.DataFrame()
 
-def process_bhavcopy(bhav_file, df_json):
+def process_bhavcopy(bhav_file, df_json, target_expiry_index=0):
     try:
         df_bhav = pd.read_csv(bhav_file)
         
@@ -225,10 +250,33 @@ def process_bhavcopy(bhav_file, df_json):
             return pd.DataFrame()
 
         futures['XpryDt'] = pd.to_datetime(futures['XpryDt'])
+        
+        # Filter out past expiries (Keep today and future)
+        # We use IST time to match the environment's expectation
+        ist_now = get_ist_now()
+        today = ist_now.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+        
+        futures = futures[futures['XpryDt'] >= today]
+        if futures.empty:
+            st.warning("No future expiries found in the uploaded file.")
+            return pd.DataFrame()
+
         futures = futures.sort_values('XpryDt')
         
-        # Find nearest expiry per symbol
-        near_futures = futures.groupby('TckrSymb').first().reset_index()
+        # Identify unique expiry dates available in the bhavcopy
+        available_expiries = sorted(futures['XpryDt'].unique())
+        
+        # Select target expiry based on index (0 for Near, 1 for Next)
+        if target_expiry_index >= len(available_expiries):
+            # Fallback to the latest available if index is out of range
+            target_expiry = available_expiries[-1]
+        else:
+            target_expiry = available_expiries[target_expiry_index]
+
+        # Filter futures for the target expiry per symbol
+        near_futures = futures[futures['XpryDt'] == target_expiry].copy()
+        
+        # If a symbol doesn't have the target expiry, it will be skipped
         near_futures = near_futures[['TckrSymb', 'ClsPric', 'XpryDt']]
         near_futures = near_futures.rename(columns={'ClsPric': 'FuturePrice', 'XpryDt': 'FutureExpiryDate'})
 
@@ -240,7 +288,7 @@ def process_bhavcopy(bhav_file, df_json):
 
         options['XpryDt'] = pd.to_datetime(options['XpryDt'])
 
-        # Merge Options with Near Futures
+        # Merge Options with selected Futures expiry
         merged = pd.merge(options, near_futures, on='TckrSymb')
         merged = merged[merged['XpryDt'] == merged['FutureExpiryDate']]
         
@@ -314,25 +362,39 @@ def fetch_ltp(instrument_keys, token):
     
     batches = [instrument_keys[i:i + batch_size] for i in range(0, len(instrument_keys), batch_size)]
     
-    for batch in batches:
+    def fetch_batch(batch):
         params = {'instrument_key': ','.join(batch)}
         try:
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, timeout=10)
             if response.status_code == 200:
                 data = response.json()
                 if data.get('status') == 'success':
                     quotes = data.get('data', {})
+                    result = {}
                     for key, details in quotes.items():
                         inst_token = details.get('instrument_token')
                         last_price = details.get('last_price')
-                        if inst_token:
-                            ltp_map[inst_token] = last_price
+                        if inst_token is not None:
+                            result[inst_token] = last_price
+                    return result
         except Exception:
             pass
-            
+        return {}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_batch, batch) for batch in batches]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                batch_result = future.result()
+                if batch_result:
+                    ltp_map.update(batch_result)
+            except Exception:
+                pass
+    
     return ltp_map
 
 def display_option_chain(df, access_token, key_suffix):
+    st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     if df.empty:
         st.info("No data to display. Please upload a valid Bhavcopy in the sidebar.")
         return
@@ -369,12 +431,12 @@ def display_option_chain(df, access_token, key_suffix):
         
         if should_fetch:
             keys_to_fetch = all_keys if is_market_hours else missing_keys
-            with st.spinner(f'Fetching LTP for {key_suffix} ({fetch_reason})...'):
-                fetched_data = fetch_ltp(keys_to_fetch, access_token)
-                if fetched_data:
-                    save_ltp_cache(fetched_data)
-                    # Reload cache to get complete set
-                    ltp_cache = load_ltp_cache()
+            # Fetch silently
+            fetched_data = fetch_ltp(keys_to_fetch, access_token)
+            if fetched_data:
+                save_ltp_cache(fetched_data)
+                # Reload cache to get complete set
+                ltp_cache = load_ltp_cache()
         
         # Use data from cache
         ltp_data = {k: ltp_cache.get(k, 0.0) for k in all_keys}
@@ -460,7 +522,7 @@ def display_option_chain(df, access_token, key_suffix):
             calls_df[display_cols].style
             .map(color_change, subset=['change %'])
             .format(format_dict)
-            .set_properties(**{'font-weight': 'bold', 'text-align': 'center', 'font-size': '16px'}),
+            .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
             hide_index=True, 
             use_container_width=True,
             height=1800
@@ -472,149 +534,193 @@ def display_option_chain(df, access_token, key_suffix):
             puts_df[display_cols].style
             .map(color_change, subset=['change %'])
             .format(format_dict)
-            .set_properties(**{'font-weight': 'bold', 'text-align': 'center', 'font-size': '16px'}),
+            .set_properties(**{'font-weight': '600', 'text-align': 'center', 'font-size': '16px'}),
             hide_index=True, 
             use_container_width=True,
             height=1800
         )
 
-# --- Sidebar ---
-with st.sidebar:
-    st.header("Configuration")
-    
-    # Persistent Token Logic
-    saved_token = load_token()
-    access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
-    
-    if access_token and access_token != saved_token:
-        save_token(access_token)
-    
-    st.markdown("---")
-    st.header("Data Management")
-    
-    # NSE JSON Uploader
-    st.subheader("NSE Instrument JSON")
-    
-    if st.button("🔄 Download Latest"):
-        try:
-            with st.spinner("Downloading latest NSE.json from Upstox..."):
-                url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                }
-                response = requests.get(url, headers=headers, stream=True)
-                if response.status_code == 200:
-                    with open(NSE_JSON_PATH, "wb") as f_out:
-                        with gzip.GzipFile(fileobj=response.raw) as f_in:
-                            shutil.copyfileobj(f_in, f_out)
-                    st.cache_data.clear()
-                    st.success("Updated successfully!")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error(f"Failed to download. Status: {response.status_code}")
-        except Exception as e:
-            st.error(f"Error: {e}")
+# --- Configuration Logic (Before Sidebar) ---
+# Check if we should enter "Client View" (No Sidebar, Token from Secrets)
+# To see the sidebar (Admin View), remove or comment out UPSTOX_ACCESS_TOKEN in .streamlit/secrets.toml
+is_client_view = "UPSTOX_ACCESS_TOKEN" in st.secrets and st.secrets["UPSTOX_ACCESS_TOKEN"].strip() != ""
 
+if is_client_view:
+    # CLIENT VIEW DEFAULTS
+    access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
+    # Hide sidebar completely for clients
+    st.markdown("""
+    <style>
+        [data-testid="stSidebar"] {display: none;}
+    </style>
+    """, unsafe_allow_html=True)
     
-    # Monthly Uploader
-    st.subheader("Monthly")
-    up_m = st.file_uploader("Upload Monthly Bhavcopy", type=['csv'], key='m_up')
-    if up_m is not None:
-        with open(FILES['Monthly'], "wb") as f:
-            f.write(up_m.getbuffer())
-        # Extract and save date
-        date_str = extract_date_from_filename(up_m.name)
-        if date_str:
-            save_meta('Monthly', date_str)
-        st.success("Monthly file updated!")
+    # Default refresh settings for clients
+    auto_refresh = True
+    refresh_interval = 15
+    target_expiry_idx = 0 # Default to current month for clients
     
-    meta = load_meta()
-    if 'Monthly' in meta and os.path.exists(FILES['Monthly']):
-        st.caption(f"📅 Data Date: {meta['Monthly']}")
-    elif os.path.exists(FILES['Monthly']):
-        # Fallback to file time if no meta date
-        m_time = os.path.getmtime(FILES['Monthly'])
-        st.caption(f"📅 Last Updated: {datetime.fromtimestamp(m_time).strftime('%Y-%m-%d %H:%M')}")
-    
-    # Weekly Uploader
-    st.subheader("Weekly")
-    up_w = st.file_uploader("Upload Weekly Bhavcopy", type=['csv'], key='w_up')
-    if up_w is not None:
-        with open(FILES['Weekly'], "wb") as f:
-            f.write(up_w.getbuffer())
-        # Extract and save date
-        date_str = extract_date_from_filename(up_w.name)
-        if date_str:
-            save_meta('Weekly', date_str)
-        st.success("Weekly file updated!")
-
-    if 'Weekly' in meta and os.path.exists(FILES['Weekly']):
-        st.caption(f"📅 Data Date: {meta['Weekly']}")
-    elif os.path.exists(FILES['Weekly']):
-        w_time = os.path.getmtime(FILES['Weekly'])
-        st.caption(f"📅 Last Updated: {datetime.fromtimestamp(w_time).strftime('%Y-%m-%d %H:%M')}")
-    
-    # Intraday Uploader
-    st.subheader("Intraday")
-    up_i = st.file_uploader("Upload Intraday Bhavcopy", type=['csv'], key='i_up')
-    if up_i is not None:
-        with open(FILES['Intraday'], "wb") as f:
-            f.write(up_i.getbuffer())
-        # Extract and save date
-        date_str = extract_date_from_filename(up_i.name)
-        if date_str:
-            save_meta('Intraday', date_str)
-        st.success("Intraday file updated!")
-    
-    if 'Intraday' in meta and os.path.exists(FILES['Intraday']):
-        st.caption(f"📅 Data Date: {meta['Intraday']}")
-    elif os.path.exists(FILES['Intraday']):
-        i_time = os.path.getmtime(FILES['Intraday'])
-        st.caption(f"📅 Last Updated: {datetime.fromtimestamp(i_time).strftime('%Y-%m-%d %H:%M')}")
+else:
+    # ADMIN VIEW (Show Sidebar)
+    with st.sidebar:
+        st.header("Configuration")
         
-    st.markdown("---")
-    st.header("Auto Refresh")
-    auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
-    refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
+        # Local Token Logic
+        saved_token = load_token()
+        access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
+        
+        if access_token and access_token != saved_token:
+            save_token(access_token)
+
+        st.markdown("---")
+        st.header("Expiry Settings")
+        # Expiry Selection for Monthly/Weekly/Intraday
+        expiry_type = st.radio(
+            "Select Expiry Month",
+            options=["Current Month", "Next Month"],
+            index=0,
+            help="Choose which expiry month to display data for."
+        )
+        target_expiry_idx = 0 if expiry_type == "Current Month" else 1
+    
+        st.markdown("---")
+        st.header("Data Management")
+        
+        # NSE JSON Uploader
+        st.subheader("NSE Instrument JSON")
+        
+        if st.button("🔄 Download Latest"):
+            try:
+                with st.spinner("Downloading latest NSE.json from Upstox..."):
+                    url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    }
+                    response = requests.get(url, headers=headers, stream=True)
+                    if response.status_code == 200:
+                        with open(NSE_JSON_PATH, "wb") as f_out:
+                            with gzip.GzipFile(fileobj=response.raw) as f_in:
+                                shutil.copyfileobj(f_in, f_out)
+                        st.cache_data.clear()
+                        st.success("Updated successfully!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to download. Status: {response.status_code}")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+        
+        # Monthly Uploader
+        st.subheader("Monthly")
+        up_m = st.file_uploader("Upload Monthly Bhavcopy", type=['zip'], key='m_up')
+        if up_m is not None:
+            csv_content, csv_name = extract_csv_from_zip(up_m)
+            if csv_content:
+                with open(FILES['Monthly'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date from the CSV filename within the ZIP
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Monthly', date_str)
+                st.success(f"Monthly file updated from {csv_name}!")
+        
+        meta = load_meta()
+        if 'Monthly' in meta and os.path.exists(FILES['Monthly']):
+            st.caption(f"📅 Data Date: {meta['Monthly']}")
+        elif os.path.exists(FILES['Monthly']):
+            # Fallback to file time if no meta date
+            m_time = os.path.getmtime(FILES['Monthly'])
+            st.caption(f"📅 Last Updated: {datetime.fromtimestamp(m_time).strftime('%Y-%m-%d %H:%M')}")
+        
+        # Weekly Uploader
+        st.subheader("Weekly")
+        up_w = st.file_uploader("Upload Weekly Bhavcopy", type=['zip'], key='w_up')
+        if up_w is not None:
+            csv_content, csv_name = extract_csv_from_zip(up_w)
+            if csv_content:
+                with open(FILES['Weekly'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Weekly', date_str)
+                st.success(f"Weekly file updated from {csv_name}!")
+
+        if 'Weekly' in meta and os.path.exists(FILES['Weekly']):
+            st.caption(f"📅 Data Date: {meta['Weekly']}")
+        elif os.path.exists(FILES['Weekly']):
+            w_time = os.path.getmtime(FILES['Weekly'])
+            st.caption(f"📅 Last Updated: {datetime.fromtimestamp(w_time).strftime('%Y-%m-%d %H:%M')}")
+        
+        # Intraday Uploader
+        st.subheader("Intraday")
+        up_i = st.file_uploader("Upload Intraday Bhavcopy", type=['zip'], key='i_up')
+        if up_i is not None:
+            csv_content, csv_name = extract_csv_from_zip(up_i)
+            if csv_content:
+                with open(FILES['Intraday'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Intraday', date_str)
+                st.success(f"Intraday file updated from {csv_name}!")
+        
+        if 'Intraday' in meta and os.path.exists(FILES['Intraday']):
+            st.caption(f"📅 Data Date: {meta['Intraday']}")
+        elif os.path.exists(FILES['Intraday']):
+            i_time = os.path.getmtime(FILES['Intraday'])
+            st.caption(f"📅 Last Updated: {datetime.fromtimestamp(i_time).strftime('%Y-%m-%d %H:%M')}")
+            
+        st.markdown("---")
+        st.header("Auto Refresh")
+        auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
+        refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
 
 # --- Main Page ---
 st.title("Positional Stock Option Scanner")
-st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
+# st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
 
 nse_json_df = load_nse_json()
 
 if not nse_json_df.empty:
     tab1, tab2, tab3 = st.tabs(["Monthly", "Weekly", "Intraday"])
+    
+    run_every = refresh_interval if auto_refresh else None
 
     with tab1:
-        st.header("Monthly Options")
+        st.header(f"Monthly Options ({expiry_type if not is_client_view else 'Current Month'})")
         if os.path.exists(FILES['Monthly']):
-            df_m = process_bhavcopy(FILES['Monthly'], nse_json_df)
-            display_option_chain(df_m, access_token, "Monthly")
+            @st.fragment(run_every=run_every)
+            def show_monthly():
+                df_m = process_bhavcopy(FILES['Monthly'], nse_json_df, target_expiry_index=target_expiry_idx)
+                display_option_chain(df_m, access_token, "Monthly")
+            show_monthly()
         else:
             st.info("Please upload a Monthly Bhavcopy in the sidebar to view data.")
 
     with tab2:
-        st.header("Weekly Options")
+        st.header(f"Weekly Options ({expiry_type if not is_client_view else 'Current Month'})")
         if os.path.exists(FILES['Weekly']):
-            df_w = process_bhavcopy(FILES['Weekly'], nse_json_df)
-            display_option_chain(df_w, access_token, "Weekly")
+            @st.fragment(run_every=run_every)
+            def show_weekly():
+                df_w = process_bhavcopy(FILES['Weekly'], nse_json_df, target_expiry_index=target_expiry_idx)
+                display_option_chain(df_w, access_token, "Weekly")
+            show_weekly()
         else:
             st.info("Please upload a Weekly Bhavcopy in the sidebar to view data.")
 
     with tab3:
-        st.header("Intraday Options")
+        st.header(f"Intraday Options ({expiry_type if not is_client_view else 'Current Month'})")
         if os.path.exists(FILES['Intraday']):
-            df_i = process_bhavcopy(FILES['Intraday'], nse_json_df)
-            display_option_chain(df_i, access_token, "Intraday")
+            @st.fragment(run_every=run_every)
+            def show_intraday():
+                df_i = process_bhavcopy(FILES['Intraday'], nse_json_df, target_expiry_index=target_expiry_idx)
+                display_option_chain(df_i, access_token, "Intraday")
+            show_intraday()
         else:
             st.info("Please upload an Intraday Bhavcopy in the sidebar to view data.")
 
 else:
     st.error("Critical Error: NSE.json could not be loaded.")
-
-# Auto-Refresh Logic
-if auto_refresh:
-    time.sleep(refresh_interval)
-    st.rerun()
